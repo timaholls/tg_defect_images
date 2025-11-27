@@ -198,6 +198,11 @@ class S3Storage:
 
         return f"{self.defect_base_folder}/{defect_id}"
 
+    def ensure_defect_base_folder_exists(self) -> bool:
+        """Проверить и создать базовую папку __tg_bot_photos_defect, если её нет."""
+
+        return self.create_folder(self.defect_base_folder)
+
     def create_defect_folder(self, defect_id: str) -> bool:
         """Создать папку для конкретного дефекта."""
 
@@ -321,6 +326,53 @@ class S3Storage:
         except Exception as e:
             print(f"Error saving defect file to S3 ({key}): {str(e)}")
             return None
+
+    def get_last_defect_number(self) -> int:
+        """
+        Получить последний использованный номер дефекта из файла last_id.txt в S3.
+
+        Если файла нет, возвращает 0 (следующий будет D1).
+        """
+
+        key = f"{self.defect_base_folder}/last_id.txt"
+
+        try:
+            obj = self.s3_client.get_object(Bucket=self.bucket_name, Key=key)
+            content = obj["Body"].read().decode("utf-8").strip()
+            return int(content)
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "NoSuchKey":
+                print(f"last_id.txt not found, starting from D1")
+                return 0
+            else:
+                print(f"Error reading last_id.txt: {str(e)}")
+                return 0
+        except (ValueError, AttributeError) as e:
+            print(f"Error parsing last_id.txt: {str(e)}")
+            return 0
+
+    def save_last_defect_number(self, number: int) -> bool:
+        """
+        Сохранить последний использованный номер дефекта в файл last_id.txt в S3.
+        """
+
+        key = f"{self.defect_base_folder}/last_id.txt"
+
+        try:
+            # Создаём базовую папку, если её нет
+            self.ensure_defect_base_folder_exists()
+
+            self.s3_client.put_object(
+                Bucket=self.bucket_name,
+                Key=key,
+                Body=str(number).encode("utf-8"),
+                ContentType="text/plain; charset=utf-8",
+            )
+            print(f"Last defect number saved: {number}")
+            return True
+        except Exception as e:
+            print(f"Error saving last_id.txt: {str(e)}")
+            return False
 
 # Создаем глобальный экземпляр для использования в боте
 s3_storage = S3Storage()
