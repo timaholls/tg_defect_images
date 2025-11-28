@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import zipfile
 from datetime import datetime
 from typing import List, Dict, Any
 
@@ -409,7 +410,7 @@ def format_defect_for_view(defect_data: Dict[str, Any], hide_summary: bool = Tru
     return "\n".join(lines)
 
 
-def generate_pdf_html(defect_data: Dict[str, Any], photo_base64_list: List[str], video_urls: List[str]) -> str:
+def generate_pdf_html(defect_data: Dict[str, Any], photo_base64_list: List[str], video_urls: List[str], materials_url: str = None) -> str:
     """
     Генерация HTML шаблона для PDF с данными дефекта.
     
@@ -417,6 +418,7 @@ def generate_pdf_html(defect_data: Dict[str, Any], photo_base64_list: List[str],
         defect_data: Данные дефекта из JSON
         photo_base64_list: Список base64 строк фотографий
         video_urls: Список URL видео из S3
+        materials_url: URL для скачивания архива с материалами
     """
     
     defect_id = defect_data.get('id', 'N/A')
@@ -459,6 +461,17 @@ def generate_pdf_html(defect_data: Dict[str, Any], photo_base64_list: List[str],
         for idx, video_url in enumerate(video_urls, 1):
             videos_html += f'<li><span class="video-label">Ссылка на видео {idx}:</span><br><a href="{video_url}" target="_blank">{video_url}</a></li>'
         videos_html += '</ul></div>'
+    
+    # Генерируем HTML для кнопки скачивания материалов
+    download_html = ""
+    if materials_url:
+        download_html = f'''
+        <div class="download-section">
+            <h2>📥 Скачать все материалы</h2>
+            <p>Нажмите на кнопку ниже, чтобы скачать все фото и видео одним архивом:</p>
+            <a href="{materials_url}" target="_blank" class="download-button">Скачать архив (ZIP)</a>
+        </div>
+        '''
     
     html_template = f'''
     <!DOCTYPE html>
@@ -572,6 +585,8 @@ def generate_pdf_html(defect_data: Dict[str, Any], photo_base64_list: List[str],
                 margin: 5px 0;
             }}
             .videos-section {{
+                page-break-before: always;
+                page-break-inside: avoid;
                 margin-top: 30px;
             }}
             .videos-section h2 {{
@@ -604,6 +619,37 @@ def generate_pdf_html(defect_data: Dict[str, Any], photo_base64_list: List[str],
             .video-list a:hover {{
                 text-decoration: underline;
             }}
+            .download-section {{
+                page-break-before: always;
+                page-break-inside: avoid;
+                margin-top: 30px;
+                padding: 40px 20px;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                border-radius: 10px;
+                text-align: center;
+                color: white;
+                min-height: 200px;
+            }}
+            .download-section h2 {{
+                color: white;
+                margin-top: 0;
+                margin-bottom: 20px;
+                font-size: 24px;
+            }}
+            .download-section p {{
+                margin-bottom: 25px;
+                font-size: 16px;
+            }}
+            .download-button {{
+                display: inline-block;
+                padding: 15px 40px;
+                background: white;
+                color: #667eea;
+                text-decoration: none;
+                border-radius: 25px;
+                font-weight: bold;
+                font-size: 18px;
+            }}
             .footer {{
                 margin-top: 40px;
                 padding-top: 20px;
@@ -631,7 +677,7 @@ def generate_pdf_html(defect_data: Dict[str, Any], photo_base64_list: List[str],
                 <div class="info-value">{formatted_date}</div>
             </div>
             <div class="info-row">
-                <div class="info-label">Образование дефекта:</div>
+                <div class="info-label">Фиксация дефекта:</div>
                 <div class="info-value">{origin_title}</div>
             </div>
             <div class="info-row">
@@ -653,6 +699,8 @@ def generate_pdf_html(defect_data: Dict[str, Any], photo_base64_list: List[str],
         
         {videos_html}
         
+        {download_html}
+        
         <div class="footer">
             <p>Документ сгенерирован автоматически</p>
             <p>Дата создания: {formatted_date}</p>
@@ -662,6 +710,68 @@ def generate_pdf_html(defect_data: Dict[str, Any], photo_base64_list: List[str],
     '''
     
     return html_template
+
+
+async def create_materials_zip(
+    defect_id: str,
+    defect_data: Dict[str, Any],
+    message: types.Message,
+) -> tuple[bytes, List[bytes], List[bytes]]:
+    """
+    Создание ZIP архива со всеми материалами (фото и видео).
+    
+    Args:
+        defect_id: ID дефекта
+        defect_data: Данные дефекта из JSON
+        message: Сообщение для доступа к боту
+    
+    Returns:
+        tuple: (ZIP архив в байтах, список фото в байтах, список видео в байтах)
+    """
+    
+    bot = message.bot
+    photos = defect_data.get("photos", [])
+    videos = defect_data.get("videos", [])
+    
+    photo_bytes_list = []
+    video_bytes_list = []
+    
+    # Создаем ZIP архив в памяти
+    zip_buffer = io.BytesIO()
+    
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        # Скачиваем и добавляем фото
+        for idx, photo_info in enumerate(photos, 1):
+            file_id = photo_info.get("file_id")
+            filename = photo_info.get("filename", f"photo_{idx}.jpg")
+            if not file_id:
+                continue
+            try:
+                file = await bot.get_file(file_id)
+                downloaded = await bot.download_file(file.file_path)
+                photo_bytes = downloaded.read()
+                photo_bytes_list.append(photo_bytes)
+                zip_file.writestr(f"photos/{filename}", photo_bytes)
+            except Exception as e:
+                logging.error(f"Ошибка при загрузке фото для ZIP: {e}")
+        
+        # Скачиваем и добавляем видео
+        for idx, video_info in enumerate(videos, 1):
+            file_id = video_info.get("file_id")
+            filename = video_info.get("filename", f"video_{idx}.mp4")
+            if not file_id:
+                continue
+            try:
+                file = await bot.get_file(file_id)
+                downloaded = await bot.download_file(file.file_path)
+                video_bytes = downloaded.read()
+                video_bytes_list.append(video_bytes)
+                zip_file.writestr(f"videos/{filename}", video_bytes)
+            except Exception as e:
+                logging.error(f"Ошибка при загрузке видео для ZIP: {e}")
+    
+    zip_buffer.seek(0)
+    return zip_buffer.read(), photo_bytes_list, video_bytes_list
 
 
 async def generate_defect_pdf(
@@ -684,24 +794,39 @@ async def generate_defect_pdf(
     if not WEASYPRINT_AVAILABLE:
         raise ImportError("weasyprint не установлен. Установите его через: pip install weasyprint")
     
-    bot = message.bot
     photos = defect_data.get("photos", [])
     videos = defect_data.get("videos", [])
     
-    # Скачиваем фотографии и конвертируем в base64
-    photo_base64_list = []
-    for photo_info in photos:
-        file_id = photo_info.get("file_id")
-        if not file_id:
-            continue
+    # Создаем ZIP архив и получаем материалы
+    materials_url = None
+    photo_bytes_list = []
+    video_bytes_list = []
+    
+    if photos or videos:
         try:
-            file = await bot.get_file(file_id)
-            downloaded = await bot.download_file(file.file_path)
-            photo_bytes = downloaded.read()
-            photo_base64 = base64.b64encode(photo_bytes).decode('utf-8')
-            photo_base64_list.append(photo_base64)
+            zip_bytes, photo_bytes_list, video_bytes_list = await create_materials_zip(
+                defect_id, defect_data, message
+            )
+            
+            # Сохраняем ZIP в S3
+            zip_filename = f"materials_{defect_id}.zip"
+            zip_key = s3_storage.save_defect_file(
+                defect_id=defect_id,
+                filename=zip_filename,
+                data=zip_bytes,
+                content_type="application/zip",
+            )
+            
+            if zip_key:
+                materials_url = s3_storage.get_file_url(defect_id, zip_filename)
         except Exception as e:
-            logging.error(f"Ошибка при загрузке фото для PDF: {e}")
+            logging.error(f"Ошибка при создании ZIP архива: {e}")
+    
+    # Конвертируем фото в base64 для вставки в PDF
+    photo_base64_list = []
+    for photo_bytes in photo_bytes_list:
+        photo_base64 = base64.b64encode(photo_bytes).decode('utf-8')
+        photo_base64_list.append(photo_base64)
     
     # Получаем URL видео из S3
     video_urls = []
@@ -713,7 +838,7 @@ async def generate_defect_pdf(
                 video_urls.append(video_url)
     
     # Генерируем HTML
-    html_content = generate_pdf_html(defect_data, photo_base64_list, video_urls)
+    html_content = generate_pdf_html(defect_data, photo_base64_list, video_urls, materials_url)
     
     # Конвертируем HTML в PDF
     html = HTML(string=html_content)
