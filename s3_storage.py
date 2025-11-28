@@ -374,6 +374,29 @@ class S3Storage:
             print(f"Error saving last_id.txt: {str(e)}")
             return False
 
+    def file_exists(self, defect_id: str, filename: str) -> bool:
+        """
+        Проверить существование файла в папке дефекта.
+        
+        Args:
+            defect_id: ID дефекта
+            filename: Имя файла
+        
+        Returns:
+            True если файл существует, False в противном случае
+        """
+        folder = self.get_defect_folder(defect_id)
+        key = f"{folder}/{filename}"
+        
+        try:
+            self.s3_client.head_object(Bucket=self.bucket_name, Key=key)
+            return True
+        except ClientError as e:
+            if e.response['Error']['Code'] == '404':
+                return False
+            print(f"Error checking file existence ({key}): {str(e)}")
+            return False
+
     def get_file_url(self, defect_id: str, filename: str, expires_in: int = 3600) -> str | None:
         """
         Получить публичную URL для файла дефекта из S3.

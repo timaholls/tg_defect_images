@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import io
 import json
 import logging
@@ -6,6 +7,13 @@ import os
 import re
 from datetime import datetime
 from typing import List, Dict, Any
+
+try:
+    from weasyprint import HTML, CSS
+    WEASYPRINT_AVAILABLE = True
+except (ImportError, OSError) as e:
+    WEASYPRINT_AVAILABLE = False
+    logging.warning(f"WeasyPrint недоступен: {e}. Установите системные зависимости (см. INSTALL_WEASYPRINT.md)")
 
 from aiogram import types, F
 from aiogram.fsm.context import FSMContext
@@ -15,6 +23,7 @@ from aiogram.types import (
     ReplyKeyboardRemove,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    BufferedInputFile,
 )
 
 from openai import AsyncOpenAI
@@ -82,6 +91,16 @@ def get_back_inline_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="reg_back")]
+        ]
+    )
+
+
+def get_cancel_keyboard() -> InlineKeyboardMarkup:
+    """Инлайн‑клавиатура только с кнопкой 'Отмена'."""
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✖️ Отмена", callback_data="cancel_action")]
         ]
     )
 
@@ -388,6 +407,412 @@ def format_defect_for_view(defect_data: Dict[str, Any], hide_summary: bool = Tru
     lines.append(f"5. Видео дефекта: {len(videos)} шт.")
 
     return "\n".join(lines)
+
+
+def generate_pdf_html(defect_data: Dict[str, Any], photo_base64_list: List[str], video_urls: List[str]) -> str:
+    """
+    Генерация HTML шаблона для PDF с данными дефекта.
+    
+    Args:
+        defect_data: Данные дефекта из JSON
+        photo_base64_list: Список base64 строк фотографий
+        video_urls: Список URL видео из S3
+    """
+    
+    defect_id = defect_data.get('id', 'N/A')
+    origin = defect_data.get('origin', 'N/A')
+    manufacturer = defect_data.get('manufacturer', 'N/A')
+    model = defect_data.get('model', 'N/A')
+    description = defect_data.get('raw_description', 'N/A')
+    created_at = defect_data.get('created_at', '')
+    
+    # Форматируем дату
+    try:
+        if created_at:
+            dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+            formatted_date = dt.strftime('%d.%m.%Y %H:%M')
+        else:
+            formatted_date = 'N/A'
+    except:
+        formatted_date = created_at if created_at else 'N/A'
+    
+    # Получаем название происхождения дефекта
+    origin_title = ORIGIN_TITLES.get(DefectOrigin(origin), origin) if origin != 'N/A' else 'N/A'
+    
+    # Генерируем HTML для фотографий (по 2 на странице)
+    photos_html = ""
+    if photo_base64_list:
+        photos_html = '<div class="photos-section"><h2>📸 Фотографии дефекта</h2><div class="photos-grid">'
+        for idx, photo_base64 in enumerate(photo_base64_list, 1):
+            photos_html += f'''
+            <div class="photo-item">
+                <img src="data:image/jpeg;base64,{photo_base64}" alt="Фото {idx}" />
+                <p class="photo-caption">Фото {idx} из {len(photo_base64_list)}</p>
+            </div>
+            '''
+        photos_html += '</div></div>'
+    
+    # Генерируем HTML для видео
+    videos_html = ""
+    if video_urls:
+        videos_html = '<div class="videos-section"><h2>🎥 Видео дефекта</h2><ul class="video-list">'
+        for idx, video_url in enumerate(video_urls, 1):
+            videos_html += f'<li><span class="video-label">Ссылка на видео {idx}:</span><br><a href="{video_url}" target="_blank">{video_url}</a></li>'
+        videos_html += '</ul></div>'
+    
+    html_template = f'''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <style>
+            @page {{
+                size: A4;
+                margin: 2cm;
+            }}
+            body {{
+                font-family: 'Arial', 'Helvetica', sans-serif;
+                line-height: 1.6;
+                color: #333;
+                background: #fff;
+            }}
+            .header {{
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                padding: 30px;
+                border-radius: 10px;
+                margin-bottom: 30px;
+                text-align: center;
+            }}
+            .header h1 {{
+                margin: 0;
+                font-size: 28px;
+                font-weight: bold;
+            }}
+            .header .defect-id {{
+                font-size: 18px;
+                margin-top: 10px;
+                opacity: 0.9;
+            }}
+            .info-section {{
+                background: #f8f9fa;
+                padding: 20px;
+                border-radius: 8px;
+                margin-bottom: 25px;
+                border-left: 4px solid #667eea;
+            }}
+            .info-section h2 {{
+                color: #667eea;
+                margin-top: 0;
+                margin-bottom: 15px;
+                font-size: 20px;
+                border-bottom: 2px solid #667eea;
+                padding-bottom: 8px;
+            }}
+            .info-row {{
+                display: flex;
+                margin-bottom: 12px;
+                padding: 8px 0;
+                border-bottom: 1px solid #e0e0e0;
+            }}
+            .info-row:last-child {{
+                border-bottom: none;
+            }}
+            .info-label {{
+                font-weight: bold;
+                color: #555;
+                width: 200px;
+                flex-shrink: 0;
+            }}
+            .info-value {{
+                color: #333;
+                flex-grow: 1;
+            }}
+            .description-box {{
+                background: #fff;
+                padding: 15px;
+                border-radius: 6px;
+                border: 1px solid #ddd;
+                margin-top: 10px;
+                white-space: pre-wrap;
+                word-wrap: break-word;
+            }}
+            .photos-section {{
+                margin-top: 30px;
+            }}
+            .photos-section h2 {{
+                color: #667eea;
+                margin-bottom: 20px;
+                font-size: 20px;
+            }}
+            .photos-grid {{
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 15px;
+                margin-bottom: 20px;
+            }}
+            .photo-item {{
+                page-break-inside: avoid;
+                text-align: center;
+                margin-bottom: 15px;
+            }}
+            .photo-item img {{
+                max-width: 100%;
+                width: 100%;
+                height: auto;
+                max-height: 300px;
+                object-fit: contain;
+                border-radius: 8px;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+                margin-bottom: 8px;
+            }}
+            .photo-caption {{
+                color: #666;
+                font-size: 12px;
+                margin: 5px 0;
+            }}
+            .videos-section {{
+                margin-top: 30px;
+            }}
+            .videos-section h2 {{
+                color: #667eea;
+                margin-bottom: 15px;
+                font-size: 20px;
+            }}
+            .video-list {{
+                list-style: none;
+                padding: 0;
+            }}
+            .video-list li {{
+                margin-bottom: 15px;
+                padding: 12px;
+                background: #f8f9fa;
+                border-radius: 6px;
+            }}
+            .video-label {{
+                font-weight: bold;
+                color: #555;
+                margin-bottom: 5px;
+                display: block;
+            }}
+            .video-list a {{
+                color: #667eea;
+                text-decoration: none;
+                word-break: break-all;
+                font-size: 12px;
+            }}
+            .video-list a:hover {{
+                text-decoration: underline;
+            }}
+            .footer {{
+                margin-top: 40px;
+                padding-top: 20px;
+                border-top: 2px solid #e0e0e0;
+                text-align: center;
+                color: #666;
+                font-size: 12px;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>Заявка о дефекте</h1>
+            <div class="defect-id">ID: {defect_id}</div>
+        </div>
+        
+        <div class="info-section">
+            <h2>📋 Основная информация</h2>
+            <div class="info-row">
+                <div class="info-label">ID дефекта:</div>
+                <div class="info-value">{defect_id}</div>
+            </div>
+            <div class="info-row">
+                <div class="info-label">Дата создания:</div>
+                <div class="info-value">{formatted_date}</div>
+            </div>
+            <div class="info-row">
+                <div class="info-label">Образование дефекта:</div>
+                <div class="info-value">{origin_title}</div>
+            </div>
+            <div class="info-row">
+                <div class="info-label">Производитель:</div>
+                <div class="info-value">{manufacturer}</div>
+            </div>
+            <div class="info-row">
+                <div class="info-label">Модель:</div>
+                <div class="info-value">{model}</div>
+            </div>
+        </div>
+        
+        <div class="info-section">
+            <h2>📝 Описание дефекта</h2>
+            <div class="description-box">{description}</div>
+        </div>
+        
+        {photos_html}
+        
+        {videos_html}
+        
+        <div class="footer">
+            <p>Документ сгенерирован автоматически</p>
+            <p>Дата создания: {formatted_date}</p>
+        </div>
+    </body>
+    </html>
+    '''
+    
+    return html_template
+
+
+async def generate_defect_pdf(
+    defect_id: str,
+    defect_data: Dict[str, Any],
+    message: types.Message,
+) -> bytes:
+    """
+    Генерация PDF файла с данными дефекта.
+    
+    Args:
+        defect_id: ID дефекта
+        defect_data: Данные дефекта из JSON
+        message: Сообщение для доступа к боту
+    
+    Returns:
+        bytes: PDF файл в виде байтов
+    """
+    
+    if not WEASYPRINT_AVAILABLE:
+        raise ImportError("weasyprint не установлен. Установите его через: pip install weasyprint")
+    
+    bot = message.bot
+    photos = defect_data.get("photos", [])
+    videos = defect_data.get("videos", [])
+    
+    # Скачиваем фотографии и конвертируем в base64
+    photo_base64_list = []
+    for photo_info in photos:
+        file_id = photo_info.get("file_id")
+        if not file_id:
+            continue
+        try:
+            file = await bot.get_file(file_id)
+            downloaded = await bot.download_file(file.file_path)
+            photo_bytes = downloaded.read()
+            photo_base64 = base64.b64encode(photo_bytes).decode('utf-8')
+            photo_base64_list.append(photo_base64)
+        except Exception as e:
+            logging.error(f"Ошибка при загрузке фото для PDF: {e}")
+    
+    # Получаем URL видео из S3
+    video_urls = []
+    for video_info in videos:
+        filename = video_info.get("filename")
+        if filename:
+            video_url = s3_storage.get_file_url(defect_id, filename)
+            if video_url:
+                video_urls.append(video_url)
+    
+    # Генерируем HTML
+    html_content = generate_pdf_html(defect_data, photo_base64_list, video_urls)
+    
+    # Конвертируем HTML в PDF
+    html = HTML(string=html_content)
+    pdf_bytes = html.write_pdf()
+    
+    return pdf_bytes
+
+
+async def get_or_generate_pdf(defect_id: str, defect_data: Dict[str, Any], message: types.Message) -> str | None:
+    """
+    Получить ссылку на PDF из S3 или сгенерировать новый, если его нет.
+    
+    Args:
+        defect_id: ID дефекта
+        defect_data: Данные дефекта из JSON
+        message: Сообщение для доступа к боту
+    
+    Returns:
+        URL на PDF файл или None при ошибке
+    """
+    
+    if not WEASYPRINT_AVAILABLE:
+        return None
+    
+    pdf_filename = f"report_{defect_id}.pdf"
+    
+    # Проверяем, существует ли PDF в S3
+    if s3_storage.file_exists(defect_id, pdf_filename):
+        # PDF уже существует, возвращаем ссылку
+        pdf_url = s3_storage.get_file_url(defect_id, pdf_filename)
+        return pdf_url
+    
+    # PDF не существует, генерируем новый
+    try:
+        pdf_bytes = await generate_defect_pdf(defect_id, defect_data, message)
+        
+        # Сохраняем PDF в S3
+        pdf_key = s3_storage.save_defect_file(
+            defect_id=defect_id,
+            filename=pdf_filename,
+            data=pdf_bytes,
+            content_type="application/pdf",
+        )
+        
+        if pdf_key:
+            pdf_url = s3_storage.get_file_url(defect_id, pdf_filename)
+            return pdf_url
+    except Exception as e:
+        logging.error(f"Ошибка при генерации PDF: {e}")
+        return None
+    
+    return None
+
+
+async def regenerate_pdf_after_edit(defect_id: str, message: types.Message) -> str | None:
+    """
+    Пересоздать PDF после редактирования заявки и вернуть ссылку.
+    
+    Args:
+        defect_id: ID дефекта
+        message: Сообщение для доступа к боту
+    
+    Returns:
+        URL на PDF файл или None при ошибке
+    """
+    
+    if not WEASYPRINT_AVAILABLE:
+        logging.warning("weasyprint не установлен, PDF не будет пересоздан")
+        return None
+    
+    # Загружаем данные дефекта
+    json_str = s3_storage.load_defect_json(defect_id)
+    if not json_str:
+        logging.error(f"Не удалось загрузить данные дефекта {defect_id}")
+        return None
+    
+    defect_data = json.loads(json_str)
+    pdf_filename = f"report_{defect_id}.pdf"
+    
+    try:
+        # Генерируем новый PDF
+        pdf_bytes = await generate_defect_pdf(defect_id, defect_data, message)
+        
+        # Сохраняем PDF в S3 (перезаписываем существующий)
+        pdf_key = s3_storage.save_defect_file(
+            defect_id=defect_id,
+            filename=pdf_filename,
+            data=pdf_bytes,
+            content_type="application/pdf",
+        )
+        
+        if pdf_key:
+            pdf_url = s3_storage.get_file_url(defect_id, pdf_filename)
+            return pdf_url
+    except Exception as e:
+        logging.error(f"Ошибка при пересоздании PDF: {e}")
+        return None
+    
+    return None
 
 
 # ==== Состояния FSM ====
@@ -842,6 +1267,48 @@ def setup_defect_handlers(dp):
             message=message,
         )
 
+        # Загружаем сохраненные данные для генерации PDF
+        json_str = s3_storage.load_defect_json(defect_id)
+        if json_str:
+            defect_data = json.loads(json_str)
+            
+            # Генерируем PDF (он будет сохранен в S3 автоматически)
+            try:
+                if WEASYPRINT_AVAILABLE:
+                    await message.answer("📄 Генерирую PDF документ...")
+                    pdf_bytes = await generate_defect_pdf(defect_id, defect_data, message)
+                    
+                    # Сохраняем PDF в S3
+                    pdf_filename = f"report_{defect_id}.pdf"
+                    pdf_key = s3_storage.save_defect_file(
+                        defect_id=defect_id,
+                        filename=pdf_filename,
+                        data=pdf_bytes,
+                        content_type="application/pdf",
+                    )
+                    
+                    # Отправляем PDF файл пользователю
+                    await message.answer_document(
+                        document=BufferedInputFile(
+                            file=pdf_bytes,
+                            filename=pdf_filename
+                        ),
+                        caption=f"📄 PDF документ по заявке {defect_id}",
+                    )
+                    
+                    # Отправляем ссылку на PDF
+                    if pdf_key:
+                        pdf_url = s3_storage.get_file_url(defect_id, pdf_filename)
+                        if pdf_url:
+                            await message.answer(
+                                f"🔗 Ссылка на PDF документ:\n\n{pdf_url}"
+                            )
+                else:
+                    logging.warning("weasyprint не установлен, PDF не будет сгенерирован")
+            except Exception as e:
+                logging.error(f"Ошибка при генерации PDF: {e}")
+                # Не прерываем процесс, просто логируем ошибку
+
         await state.clear()
 
         await message.answer(
@@ -879,7 +1346,7 @@ def setup_defect_handlers(dp):
         await state.set_state(ViewDefectStates.waiting_for_id)
         await message.answer(
             "Введите регистрационный номер дефекта:",
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=get_cancel_keyboard(),
         )
 
     @dp.message(ViewDefectStates.waiting_for_id)
@@ -888,7 +1355,8 @@ def setup_defect_handlers(dp):
 
         json_str = s3_storage.load_defect_json(defect_id)
         if not json_str:
-            await message.answer("❌ Дефект с таким ID не найден. Проверьте номер и попробуйте ещё раз.")
+            await state.clear()
+            await message.answer("❌ Дефект с таким ID не найден.", reply_markup=ReplyKeyboardRemove())
             return
 
         defect_data = json.loads(json_str)
@@ -963,6 +1431,49 @@ def setup_defect_handlers(dp):
                     # Не падаем, просто логируем в stdout
                     print(f"Failed to send video #{idx} for defect {defect_id}: {e}")
 
+        # Получаем или генерируем PDF
+        if WEASYPRINT_AVAILABLE:
+            try:
+                pdf_filename = f"report_{defect_id}.pdf"
+                if s3_storage.file_exists(defect_id, pdf_filename):
+                    # PDF уже существует
+                    pdf_url = s3_storage.get_file_url(defect_id, pdf_filename)
+                    if pdf_url:
+                        await message.answer(
+                            f"🔗 Ссылка на PDF документ:\n\n{pdf_url}",
+                            reply_markup=ReplyKeyboardRemove(),
+                        )
+                else:
+                    # PDF не существует, генерируем
+                    await message.answer("📄 Генерирую PDF документ...")
+                    pdf_url = await get_or_generate_pdf(defect_id, defect_data, message)
+                    if pdf_url:
+                        await message.answer(
+                            f"🔗 Ссылка на PDF документ:\n\n{pdf_url}",
+                            reply_markup=ReplyKeyboardRemove(),
+                        )
+                    else:
+                        await message.answer(
+                            "⚠️ Не удалось сгенерировать PDF документ.",
+                            reply_markup=ReplyKeyboardRemove(),
+                        )
+            except Exception as e:
+                logging.error(f"Ошибка при получении PDF при просмотре: {e}")
+                await message.answer(
+                    f"⚠️ Ошибка при получении PDF: {e}",
+                    reply_markup=ReplyKeyboardRemove(),
+                )
+        else:
+            # Проверяем, есть ли уже сгенерированный PDF
+            pdf_filename = f"report_{defect_id}.pdf"
+            if s3_storage.file_exists(defect_id, pdf_filename):
+                pdf_url = s3_storage.get_file_url(defect_id, pdf_filename)
+                if pdf_url:
+                    await message.answer(
+                        f"🔗 Ссылка на PDF документ:\n\n{pdf_url}",
+                        reply_markup=ReplyKeyboardRemove(),
+                    )
+        
         # Кнопка для быстрого перехода в режим редактирования текущего дефекта
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -1014,14 +1525,21 @@ def setup_defect_handlers(dp):
         await state.set_state(EditDefectStates.waiting_for_id)
         await message.answer(
             "Введите регистрационный номер дефекта, который хотите изменить:",
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=get_cancel_keyboard(),
         )
 
     # Общая команда отмены на любом шаге
     @dp.message(Command("cancel"))
     async def cmd_cancel(message: types.Message, state: FSMContext):
         await state.clear()
-        await message.answer("Заполнение заявки отменено.", reply_markup=ReplyKeyboardRemove())
+        await message.answer("Действие отменено.", reply_markup=ReplyKeyboardRemove())
+
+    @dp.callback_query(F.data == "cancel_action")
+    async def handle_cancel_action(callback_query: types.CallbackQuery, state: FSMContext):
+        """Отмена действия по инлайн-кнопке."""
+        await state.clear()
+        await callback_query.answer()
+        await callback_query.message.answer("Действие отменено.", reply_markup=ReplyKeyboardRemove())
 
     async def _start_edit_flow(message: types.Message, state: FSMContext, defect_id: str, defect_data: Dict[str, Any]):
         """
@@ -1049,7 +1567,8 @@ def setup_defect_handlers(dp):
         defect_id = message.text.strip().upper()
         json_str = s3_storage.load_defect_json(defect_id)
         if not json_str:
-            await message.answer("❌ Дефект с таким ID не найден. Проверьте номер и попробуйте ещё раз.")
+            await state.clear()
+            await message.answer("❌ Дефект с таким ID не найден.", reply_markup=ReplyKeyboardRemove())
             return
 
         defect_data = json.loads(json_str)
@@ -1178,7 +1697,14 @@ def setup_defect_handlers(dp):
         s3_storage.save_defect_json(defect_id, json.dumps(defect_data, ensure_ascii=False, indent=2))
 
         await state.clear()
-        await message.answer("✅ Производитель обновлён. Ваша заявка принята.", reply_markup=ReplyKeyboardRemove())
+        await message.answer("✅ Производитель обновлён.", reply_markup=ReplyKeyboardRemove())
+        
+        # Пересоздаем PDF
+        if WEASYPRINT_AVAILABLE:
+            await message.answer("📄 Обновляю PDF документ...")
+            pdf_url = await regenerate_pdf_after_edit(defect_id, message)
+            if pdf_url:
+                await message.answer(f"🔗 Обновленный PDF документ:\n\n{pdf_url}")
 
     @dp.message(EditDefectStates.edit_model)
     async def process_edit_model(message: types.Message, state: FSMContext):
@@ -1196,7 +1722,14 @@ def setup_defect_handlers(dp):
         s3_storage.save_defect_json(defect_id, json.dumps(defect_data, ensure_ascii=False, indent=2))
 
         await state.clear()
-        await message.answer("✅ Модель обновлена. Ваша заявка принята.", reply_markup=ReplyKeyboardRemove())
+        await message.answer("✅ Модель обновлена.", reply_markup=ReplyKeyboardRemove())
+        
+        # Пересоздаем PDF
+        if WEASYPRINT_AVAILABLE:
+            await message.answer("📄 Обновляю PDF документ...")
+            pdf_url = await regenerate_pdf_after_edit(defect_id, message)
+            if pdf_url:
+                await message.answer(f"🔗 Обновленный PDF документ:\n\n{pdf_url}")
 
     @dp.message(EditDefectStates.edit_description, F.text)
     async def process_edit_description_text(message: types.Message, state: FSMContext):
@@ -1219,7 +1752,14 @@ def setup_defect_handlers(dp):
         s3_storage.save_defect_json(defect_id, json.dumps(defect_data, ensure_ascii=False, indent=2))
 
         await state.clear()
-        await message.answer("✅ Описание обновлено. Ваша заявка принята.", reply_markup=ReplyKeyboardRemove())
+        await message.answer("✅ Описание обновлено.", reply_markup=ReplyKeyboardRemove())
+        
+        # Пересоздаем PDF
+        if WEASYPRINT_AVAILABLE:
+            await message.answer("📄 Обновляю PDF документ...")
+            pdf_url = await regenerate_pdf_after_edit(defect_id, message)
+            if pdf_url:
+                await message.answer(f"🔗 Обновленный PDF документ:\n\n{pdf_url}")
 
     @dp.message(EditDefectStates.edit_description, F.voice)
     async def process_edit_description_voice(message: types.Message, state: FSMContext):
@@ -1314,7 +1854,14 @@ def setup_defect_handlers(dp):
         s3_storage.save_defect_json(defect_id, json.dumps(defect_data, ensure_ascii=False, indent=2))
         
         await state.clear()
-        await callback_query.message.answer("✅ Описание обновлено. Ваша заявка принята.", reply_markup=ReplyKeyboardRemove())
+        await callback_query.message.answer("✅ Описание обновлено.", reply_markup=ReplyKeyboardRemove())
+        
+        # Пересоздаем PDF
+        if WEASYPRINT_AVAILABLE:
+            await callback_query.message.answer("📄 Обновляю PDF документ...")
+            pdf_url = await regenerate_pdf_after_edit(defect_id, callback_query.message)
+            if pdf_url:
+                await callback_query.message.answer(f"🔗 Обновленный PDF документ:\n\n{pdf_url}")
 
     async def handle_edit_desc_summary(callback_query: types.CallbackQuery, state: FSMContext):
         """Вспомогательная функция: обработка выбора резюмированного текста при редактировании."""
@@ -1338,7 +1885,14 @@ def setup_defect_handlers(dp):
         s3_storage.save_defect_json(defect_id, json.dumps(defect_data, ensure_ascii=False, indent=2))
         
         await state.clear()
-        await callback_query.message.answer("✅ Описание обновлено. Ваша заявка принята.", reply_markup=ReplyKeyboardRemove())
+        await callback_query.message.answer("✅ Описание обновлено.", reply_markup=ReplyKeyboardRemove())
+        
+        # Пересоздаем PDF
+        if WEASYPRINT_AVAILABLE:
+            await callback_query.message.answer("📄 Обновляю PDF документ...")
+            pdf_url = await regenerate_pdf_after_edit(defect_id, callback_query.message)
+            if pdf_url:
+                await callback_query.message.answer(f"🔗 Обновленный PDF документ:\n\n{pdf_url}")
 
     async def handle_edit_desc_rerecord(callback_query: types.CallbackQuery, state: FSMContext):
         """Вспомогательная функция: обработка запроса на повторную запись голосового сообщения при редактировании."""
@@ -1658,7 +2212,14 @@ def setup_defect_handlers(dp):
         s3_storage.save_defect_json(defect_id, json.dumps(defect_data, ensure_ascii=False, indent=2))
 
         await state.clear()
-        await message.answer("✅ Изменения сохранены. Ваша заявка принята.", reply_markup=ReplyKeyboardRemove())
+        await message.answer("✅ Изменения сохранены.", reply_markup=ReplyKeyboardRemove())
+        
+        # Пересоздаем PDF
+        if WEASYPRINT_AVAILABLE:
+            await message.answer("📄 Обновляю PDF документ...")
+            pdf_url = await regenerate_pdf_after_edit(defect_id, message)
+            if pdf_url:
+                await message.answer(f"🔗 Обновленный PDF документ:\n\n{pdf_url}")
 
     @dp.message(StateFilter(EditDefectStates.edit_photos, EditDefectStates.edit_videos), Command("save_changes"))
     async def cmd_save_media_changes(message: types.Message, state: FSMContext):
