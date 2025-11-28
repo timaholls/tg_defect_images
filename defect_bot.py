@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from typing import List, Dict, Any
 
@@ -81,6 +82,25 @@ def get_back_inline_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="reg_back")]
+        ]
+    )
+
+
+def get_description_choice_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура для выбора варианта описания: исходный/резюмированный/заново/назад."""
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="1 Вариант", callback_data="desc_original"),
+                InlineKeyboardButton(text="2 Вариант", callback_data="desc_summary"),
+            ],
+            [
+                InlineKeyboardButton(text="🔄 Наговорить заново", callback_data="desc_rerecord"),
+            ],
+            [
+                InlineKeyboardButton(text="⬅️ Назад", callback_data="reg_back"),
+            ],
         ]
     )
 
@@ -380,6 +400,7 @@ class RegisterDefectStates(StatesGroup):
     manufacturer = State()
     model = State()
     description = State()
+    choosing_description = State()  # Выбор между исходным и резюмированным текстом
     photos = State()
     videos = State()
 
@@ -392,6 +413,7 @@ class EditDefectStates(StatesGroup):
     edit_manufacturer = State()
     edit_model = State()
     edit_description = State()
+    choosing_edit_description = State()  # Выбор между исходным и резюмированным текстом при редактировании
     edit_photos = State()
     edit_videos = State()
 
@@ -535,9 +557,13 @@ def setup_defect_handlers(dp):
         
         try:
             bot = message.bot
-            voice_file = await message.voice.download(destination=io.BytesIO())
-            voice_file.seek(0)
-            voice_bytes = voice_file.read()
+            # Получаем file_id голосового сообщения
+            voice_file_id = message.voice.file_id
+            # Получаем информацию о файле
+            file = await bot.get_file(voice_file_id)
+            # Скачиваем файл
+            downloaded = await bot.download_file(file.file_path)
+            voice_bytes = downloaded.read()
             
             # Распознаём голос
             description = await transcribe_voice(voice_bytes)
@@ -550,30 +576,37 @@ def setup_defect_handlers(dp):
                 )
                 return
             
+            # Генерируем резюме синхронно, чтобы показать оба варианта
             await bot.edit_message_text(
                 chat_id=message.chat.id,
                 message_id=status_msg.message_id,
-                text=f"✅ Голосовое сообщение распознано:\n\n{description}",
+                text="⏳ Генерирую резюме...",
             )
             
-            await state.update_data(raw_description=description)
+            summary = await summarize_defect_text(description)
             
-            # Генерируем краткое резюме в фоне, чтобы не тормозить пользователя
-            async def generate_summary_and_store():
-                summary = await summarize_defect_text(description)
-                await state.update_data(summary_description=summary)
-
-            asyncio.create_task(generate_summary_and_store())
-
-            await state.set_state(RegisterDefectStates.photos)
-            await state.update_data(photo_file_ids=[])
-            await message.answer(
-                "Теперь отправьте фото дефекта.\n\n"
-                "Можно отправить несколько фотографий пачкой или по одной.\n"
-                "Каждое фото будет проверено на качество автоматически.\n"
-                "Когда закончите — нажмите кнопку «Продолжить».",
-                reply_markup=get_photos_inline_keyboard(),
+            # Сохраняем оба варианта во временное хранилище
+            await state.update_data(
+                original_description=description,
+                summary_description=summary
             )
+            
+            # Показываем оба варианта и предлагаем выбрать
+            choice_text = (
+                f"Ваш исходный текст:\n{description}\n\n"
+                f"Резюмированная версия:\n{summary}\n\n"
+                f"Выберите вариант для сохранения:"
+            )
+            
+            await bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=status_msg.message_id,
+                text=choice_text,
+                reply_markup=get_description_choice_keyboard(),
+            )
+            
+            # Переходим в состояние выбора
+            await state.set_state(RegisterDefectStates.choosing_description)
             
         except Exception as e:
             logging.error(f"Ошибка при обработке голосового сообщения: {e}")
@@ -583,21 +616,83 @@ def setup_defect_handlers(dp):
                 text=f"❌ Ошибка при обработке голосового сообщения: {e}\n\nПопробуйте отправить текст или записать голосовое сообщение ещё раз.",
             )
 
-        # Генерируем краткое резюме в фоне, чтобы не тормозить пользователя
+    async def _handle_desc_original_registration(callback_query: types.CallbackQuery, state: FSMContext):
+        """Вспомогательная функция: обработка выбора исходного текста при регистрации."""
+        
+        await callback_query.answer()
+        data = await state.get_data()
+        original_description = data.get("original_description", "")
+        
+        if not original_description:
+            await callback_query.message.answer("❌ Ошибка: исходный текст не найден.")
+            return
+        
+        # Сохраняем исходный текст как raw_description
+        await state.update_data(raw_description=original_description)
+        
+        # Генерируем резюме в фоне для хранения
         async def generate_summary_and_store():
-            summary = await summarize_defect_text(description)
+            summary = await summarize_defect_text(original_description)
             await state.update_data(summary_description=summary)
-
+        
         asyncio.create_task(generate_summary_and_store())
-
+        
+        # Переходим к следующему шагу
         await state.set_state(RegisterDefectStates.photos)
         await state.update_data(photo_file_ids=[])
-        await message.answer(
+        await callback_query.message.answer(
+            "✅ Сохранён исходный текст.\n\n"
             "Теперь отправьте фото дефекта.\n\n"
             "Можно отправить несколько фотографий пачкой или по одной.\n"
             "Каждое фото будет проверено на качество автоматически.\n"
             "Когда закончите — нажмите кнопку «Продолжить».",
             reply_markup=get_photos_inline_keyboard(),
+        )
+
+    async def _handle_desc_summary_registration(callback_query: types.CallbackQuery, state: FSMContext):
+        """Вспомогательная функция: обработка выбора резюмированного текста при регистрации."""
+        
+        await callback_query.answer()
+        data = await state.get_data()
+        summary_description = data.get("summary_description", "")
+        
+        if not summary_description:
+            await callback_query.message.answer("❌ Ошибка: резюмированный текст не найден.")
+            return
+        
+        # Сохраняем резюмированный текст как raw_description
+        await state.update_data(raw_description=summary_description)
+        # Также сохраняем summary_description (может быть полезно для истории)
+        await state.update_data(summary_description=summary_description)
+        
+        # Переходим к следующему шагу
+        await state.set_state(RegisterDefectStates.photos)
+        await state.update_data(photo_file_ids=[])
+        await callback_query.message.answer(
+            "✅ Сохранён резюмированный текст.\n\n"
+            "Теперь отправьте фото дефекта.\n\n"
+            "Можно отправить несколько фотографий пачкой или по одной.\n"
+            "Каждое фото будет проверено на качество автоматически.\n"
+            "Когда закончите — нажмите кнопку «Продолжить».",
+            reply_markup=get_photos_inline_keyboard(),
+        )
+
+    async def _handle_desc_rerecord_registration(callback_query: types.CallbackQuery, state: FSMContext):
+        """Вспомогательная функция: обработка запроса на повторную запись голосового сообщения при регистрации."""
+        
+        await callback_query.answer()
+        
+        # Возвращаемся к состоянию описания, чтобы пользователь мог записать заново
+        await state.set_state(RegisterDefectStates.description)
+        # Очищаем временные данные
+        await state.update_data(original_description=None, summary_description=None)
+        
+        await callback_query.message.answer(
+            "🎤 Запишите голосовое сообщение заново.\n\n"
+            "Опишите подробно, что случилось с товаром и в чем заключается дефект.\n\n"
+            "Постарайтесь указать максимальное количество деталей.\n\n"
+            "💡 Вы можете написать текст или отправить голосовое сообщение.",
+            reply_markup=get_back_inline_keyboard(),
         )
 
     @dp.message(RegisterDefectStates.photos, F.photo)
@@ -808,16 +903,65 @@ def setup_defect_handlers(dp):
             await message.answer("📸 Фото дефекта:")
             for idx, photo_info in enumerate(photos, start=1):
                 file_id = photo_info.get("file_id")
+                filename = photo_info.get("filename")
                 if not file_id:
                     continue
                 try:
+                    # Создаем кнопку для копирования ссылки
+                    copy_keyboard = None
+                    if filename:
+                        copy_keyboard = InlineKeyboardMarkup(
+                            inline_keyboard=[
+                                [
+                                    InlineKeyboardButton(
+                                        text="📋 Скопировать ссылку",
+                                        callback_data=f"copy_url_{defect_id}_{filename}",
+                                    )
+                                ]
+                            ]
+                        )
+                    
                     await message.answer_photo(
                         photo=file_id,
                         caption=f"Фото {idx} из {len(photos)}",
+                        reply_markup=copy_keyboard,
                     )
                 except Exception as e:
                     # Не падаем, просто логируем в stdout
                     print(f"Failed to send photo #{idx} for defect {defect_id}: {e}")
+
+        # Дополнительно подгружаем видео (если в json сохранены file_id)
+        videos = defect_data.get("videos") or []
+        if videos:
+            await message.answer("🎥 Видео дефекта:")
+            for idx, video_info in enumerate(videos, start=1):
+                file_id = video_info.get("file_id")
+                filename = video_info.get("filename")
+                if not file_id:
+                    continue
+                try:
+                    # Создаем кнопку для копирования ссылки
+                    copy_keyboard = None
+                    if filename:
+                        copy_keyboard = InlineKeyboardMarkup(
+                            inline_keyboard=[
+                                [
+                                    InlineKeyboardButton(
+                                        text="📋 Скопировать ссылку",
+                                        callback_data=f"copy_url_{defect_id}_{filename}",
+                                    )
+                                ]
+                            ]
+                        )
+                    
+                    await message.answer_video(
+                        video=file_id,
+                        caption=f"Видео {idx} из {len(videos)}",
+                        reply_markup=copy_keyboard,
+                    )
+                except Exception as e:
+                    # Не падаем, просто логируем в stdout
+                    print(f"Failed to send video #{idx} for defect {defect_id}: {e}")
 
         # Кнопка для быстрого перехода в режим редактирования текущего дефекта
         keyboard = InlineKeyboardMarkup(
@@ -831,6 +975,36 @@ def setup_defect_handlers(dp):
             ]
         )
         await message.answer("Вы можете отредактировать этот дефект:", reply_markup=keyboard)
+
+    @dp.callback_query(F.data.startswith("copy_url_"))
+    async def handle_copy_url(callback_query: types.CallbackQuery, state: FSMContext):
+        """Обработка запроса на копирование ссылки на файл из S3."""
+        
+        await callback_query.answer()
+        
+        # Парсим callback_data: copy_url_<defect_id>_<filename>
+        # Формат: copy_url_D1_photo_1.jpg или copy_url_D1_video_1.mp4
+        data = callback_query.data.replace("copy_url_", "")
+        # Ищем первое вхождение паттерна ID дефекта (D + число)
+        match = re.match(r"^(D\d+)_(.+)$", data)
+        if not match:
+            await callback_query.message.answer("❌ Ошибка: неверный формат запроса.")
+            return
+        
+        defect_id = match.group(1)
+        filename = match.group(2)
+        
+        # Получаем URL из S3
+        url = s3_storage.get_file_url(defect_id, filename)
+        
+        if not url:
+            await callback_query.message.answer("❌ Не удалось получить ссылку на файл.")
+            return
+        
+        # Отправляем ссылку пользователю
+        await callback_query.message.answer(
+            f"🔗 Ссылка на файл:\n\n{url}\n\n"
+        )
 
     # --- Редактирование дефекта ---
 
@@ -901,22 +1075,56 @@ def setup_defect_handlers(dp):
     @dp.message(EditDefectStates.choose_field)
     async def process_edit_choice(message: types.Message, state: FSMContext):
         choice = message.text.strip()
+        data = await state.get_data()
+        defect_data = data.get("defect_data", {})
 
         if choice == "1":
+            current_manufacturer = defect_data.get("manufacturer", "")
             await state.set_state(EditDefectStates.edit_manufacturer)
-            await message.answer("Введите название нового производителя:", reply_markup=get_edit_control_keyboard())
+            await message.answer(
+                f"Текущее название производителя: {current_manufacturer}\n\n"
+                "Введите новое название производителя:",
+                reply_markup=get_edit_control_keyboard(),
+            )
         elif choice == "2":
+            current_model = defect_data.get("model", "")
             await state.set_state(EditDefectStates.edit_model)
-            await message.answer("Введите название новой модель:", reply_markup=get_edit_control_keyboard())
+            await message.answer(
+                f"Текущее название модели: {current_model}\n\n"
+                "Введите новое название модели:",
+                reply_markup=get_edit_control_keyboard(),
+            )
         elif choice == "3":
+            current_description = defect_data.get("raw_description", "")
             await state.set_state(EditDefectStates.edit_description)
             await message.answer(
-                "Введите новое подробное описание того, что случилось:",
+                f"Текущее описание: {current_description}\n\n"
+                "Введите новое подробное описание того, что случилось.\n\n"
+                "💡 Вы можете написать текст или отправить голосовое сообщение.",
                 reply_markup=get_edit_control_keyboard(),
             )
         elif choice == "4":
             await state.set_state(EditDefectStates.edit_photos)
             await state.update_data(photo_file_ids=[])
+            
+            # Отправляем текущие фото
+            photos = defect_data.get("photos") or []
+            defect_id = data.get("defect_id", "")
+            if photos:
+                await message.answer("📸 Текущие фото дефекта:")
+                for idx, photo_info in enumerate(photos, start=1):
+                    file_id = photo_info.get("file_id")
+                    if not file_id:
+                        continue
+                    try:
+                        await message.answer_photo(
+                            photo=file_id,
+                            caption=f"Фото {idx} из {len(photos)}",
+                        )
+                    except Exception as e:
+                        # Не падаем, просто логируем в stdout
+                        print(f"Failed to send photo #{idx} for defect {defect_id}: {e}")
+            
             await message.answer(
                 "Отправьте новые фото дефекта.\n"
                 "Старые фото будут удалены и заменены новыми.\n"
@@ -926,6 +1134,25 @@ def setup_defect_handlers(dp):
         elif choice == "5":
             await state.set_state(EditDefectStates.edit_videos)
             await state.update_data(video_file_ids=[])
+            
+            # Отправляем текущие видео
+            videos = defect_data.get("videos") or []
+            defect_id = data.get("defect_id", "")
+            if videos:
+                await message.answer("🎥 Текущие видео дефекта:")
+                for idx, video_info in enumerate(videos, start=1):
+                    file_id = video_info.get("file_id")
+                    if not file_id:
+                        continue
+                    try:
+                        await message.answer_video(
+                            video=file_id,
+                            caption=f"Видео {idx} из {len(videos)}",
+                        )
+                    except Exception as e:
+                        # Не падаем, просто логируем в stdout
+                        print(f"Failed to send video #{idx} for defect {defect_id}: {e}")
+            
             await message.answer(
                 "Отправьте новые видео дефекта.\n"
                 "Старые видео будут удалены и заменены новыми.\n"
@@ -971,8 +1198,10 @@ def setup_defect_handlers(dp):
         await state.clear()
         await message.answer("✅ Модель обновлена. Ваша заявка принята.", reply_markup=ReplyKeyboardRemove())
 
-    @dp.message(EditDefectStates.edit_description)
-    async def process_edit_description(message: types.Message, state: FSMContext):
+    @dp.message(EditDefectStates.edit_description, F.text)
+    async def process_edit_description_text(message: types.Message, state: FSMContext):
+        """Обработка текстового описания дефекта при редактировании."""
+        
         description = message.text.strip()
         if len(description) < 10:
             await message.answer("Описание слишком короткое. Пожалуйста, опишите дефект подробнее (минимум 10 символов).")
@@ -991,6 +1220,183 @@ def setup_defect_handlers(dp):
 
         await state.clear()
         await message.answer("✅ Описание обновлено. Ваша заявка принята.", reply_markup=ReplyKeyboardRemove())
+
+    @dp.message(EditDefectStates.edit_description, F.voice)
+    async def process_edit_description_voice(message: types.Message, state: FSMContext):
+        """Обработка голосового описания дефекта при редактировании."""
+        
+        if not message.voice:
+            return
+        
+        # Показываем, что обрабатываем голосовое сообщение
+        status_msg = await message.answer("🎤 Обрабатываю голосовое сообщение...")
+        
+        try:
+            bot = message.bot
+            # Получаем file_id голосового сообщения
+            voice_file_id = message.voice.file_id
+            # Получаем информацию о файле
+            file = await bot.get_file(voice_file_id)
+            # Скачиваем файл
+            downloaded = await bot.download_file(file.file_path)
+            voice_bytes = downloaded.read()
+            
+            # Распознаём голос
+            description = await transcribe_voice(voice_bytes)
+            
+            if not description or len(description.strip()) < 10:
+                await bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=status_msg.message_id,
+                    text="❌ Не удалось распознать голосовое сообщение или оно слишком короткое.\n\nПопробуйте отправить текст или записать голосовое сообщение ещё раз.",
+                )
+                return
+            
+            # Генерируем резюме синхронно, чтобы показать оба варианта
+            await bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=status_msg.message_id,
+                text="⏳ Генерирую резюме...",
+            )
+            
+            summary = await summarize_defect_text(description)
+            
+            # Сохраняем оба варианта во временное хранилище
+            await state.update_data(
+                original_description=description,
+                summary_description=summary
+            )
+            
+            # Показываем оба варианта и предлагаем выбрать
+            choice_text = (
+                f"Ваш исходный текст:\n{description}\n\n"
+                f"Резюмированная версия:\n{summary}\n\n"
+                f"Выберите вариант для сохранения:"
+            )
+            
+            await bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=status_msg.message_id,
+                text=choice_text,
+                reply_markup=get_description_choice_keyboard(),
+            )
+            
+            # Переходим в состояние выбора
+            await state.set_state(EditDefectStates.choosing_edit_description)
+            
+        except Exception as e:
+            logging.error(f"Ошибка при обработке голосового сообщения: {e}")
+            await message.bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=status_msg.message_id,
+                text=f"❌ Ошибка при обработке голосового сообщения: {e}\n\nПопробуйте отправить текст или записать голосовое сообщение ещё раз.",
+            )
+
+    async def handle_edit_desc_original(callback_query: types.CallbackQuery, state: FSMContext):
+        """Вспомогательная функция: обработка выбора исходного текста при редактировании."""
+        
+        await callback_query.answer()
+        data = await state.get_data()
+        original_description = data.get("original_description", "")
+        
+        if not original_description:
+            await callback_query.message.answer("❌ Ошибка: исходный текст не найден.")
+            return
+        
+        defect_data = data.get("defect_data", {})
+        defect_data["raw_description"] = original_description
+        
+        # Генерируем и сохраняем резюме
+        summary = await summarize_defect_text(original_description)
+        defect_data["summary_description"] = summary
+        defect_data["updated_at"] = datetime.now().isoformat()
+        defect_id = data["defect_id"]
+        s3_storage.save_defect_json(defect_id, json.dumps(defect_data, ensure_ascii=False, indent=2))
+        
+        await state.clear()
+        await callback_query.message.answer("✅ Описание обновлено. Ваша заявка принята.", reply_markup=ReplyKeyboardRemove())
+
+    async def handle_edit_desc_summary(callback_query: types.CallbackQuery, state: FSMContext):
+        """Вспомогательная функция: обработка выбора резюмированного текста при редактировании."""
+        
+        await callback_query.answer()
+        data = await state.get_data()
+        summary_description = data.get("summary_description", "")
+        
+        if not summary_description:
+            await callback_query.message.answer("❌ Ошибка: резюмированный текст не найден.")
+            return
+        
+        defect_data = data.get("defect_data", {})
+        # Сохраняем резюмированный текст как raw_description
+        defect_data["raw_description"] = summary_description
+        # Также сохраняем summary_description
+        defect_data["summary_description"] = summary_description
+        defect_data["updated_at"] = datetime.now().isoformat()
+        
+        defect_id = data["defect_id"]
+        s3_storage.save_defect_json(defect_id, json.dumps(defect_data, ensure_ascii=False, indent=2))
+        
+        await state.clear()
+        await callback_query.message.answer("✅ Описание обновлено. Ваша заявка принята.", reply_markup=ReplyKeyboardRemove())
+
+    async def handle_edit_desc_rerecord(callback_query: types.CallbackQuery, state: FSMContext):
+        """Вспомогательная функция: обработка запроса на повторную запись голосового сообщения при редактировании."""
+        
+        await callback_query.answer()
+        
+        # Возвращаемся к состоянию описания, чтобы пользователь мог записать заново
+        await state.set_state(EditDefectStates.edit_description)
+        # Очищаем временные данные
+        await state.update_data(original_description=None, summary_description=None)
+        
+        data = await state.get_data()
+        defect_data = data.get("defect_data", {})
+        current_description = defect_data.get("raw_description", "")
+        
+        await callback_query.message.answer(
+            f"Текущее описание: {current_description}\n\n"
+            "🎤 Запишите голосовое сообщение заново.\n\n"
+            "Введите новое подробное описание того, что случилось.\n\n"
+            "💡 Вы можете написать текст или отправить голосовое сообщение.",
+            reply_markup=get_edit_control_keyboard(),
+        )
+
+    @dp.callback_query(F.data == "desc_original")
+    async def handle_desc_original_universal(callback_query: types.CallbackQuery, state: FSMContext):
+        """Универсальный обработчик для выбора исходного текста."""
+        current_state = await state.get_state()
+        
+        if current_state == EditDefectStates.choosing_edit_description.state:
+            await handle_edit_desc_original(callback_query, state)
+        elif current_state == RegisterDefectStates.choosing_description.state:
+            await _handle_desc_original_registration(callback_query, state)
+        else:
+            await callback_query.answer()
+
+    @dp.callback_query(F.data == "desc_summary")
+    async def handle_desc_summary_universal(callback_query: types.CallbackQuery, state: FSMContext):
+        """Универсальный обработчик для выбора резюмированного текста."""
+        current_state = await state.get_state()
+        
+        if current_state == EditDefectStates.choosing_edit_description.state:
+            await handle_edit_desc_summary(callback_query, state)
+        elif current_state == RegisterDefectStates.choosing_description.state:
+            await _handle_desc_summary_registration(callback_query, state)
+        else:
+            await callback_query.answer()
+
+    @dp.callback_query(F.data == "desc_rerecord")
+    async def handle_desc_rerecord_universal(callback_query: types.CallbackQuery, state: FSMContext):
+        """Универсальный обработчик для повторной записи."""
+        current_state = await state.get_state()
+        
+        if current_state == EditDefectStates.choosing_edit_description.state:
+            await handle_edit_desc_rerecord(callback_query, state)
+        elif current_state == RegisterDefectStates.choosing_description.state:
+            await _handle_desc_rerecord_registration(callback_query, state)
+        else:
+            await callback_query.answer()
 
     @dp.callback_query(F.data == "edit_cancel")
     async def handle_edit_cancel(callback_query: types.CallbackQuery, state: FSMContext):
@@ -1032,6 +1438,20 @@ def setup_defect_handlers(dp):
             await state.update_data(photo_file_ids=[])
         if current_state == EditDefectStates.edit_videos.state:
             await state.update_data(video_file_ids=[])
+
+        # Если находимся в состоянии выбора описания, возвращаемся к редактированию описания
+        if current_state == EditDefectStates.choosing_edit_description.state:
+            await state.set_state(EditDefectStates.edit_description)
+            # Очищаем временные данные
+            await state.update_data(original_description=None, summary_description=None)
+            current_description = defect_data.get("raw_description", "")
+            await callback_query.message.answer(
+                f"Текущее описание: {current_description}\n\n"
+                "Введите новое подробное описание того, что случилось.\n\n"
+                "💡 Вы можете написать текст или отправить голосовое сообщение.",
+                reply_markup=get_edit_control_keyboard(),
+            )
+            return
 
         if current_state in {
             EditDefectStates.edit_manufacturer.state,
@@ -1083,6 +1503,17 @@ def setup_defect_handlers(dp):
             await state.set_state(RegisterDefectStates.model)
             await callback_query.message.answer(
                 "Введите модель товара:",
+                reply_markup=get_back_inline_keyboard(),
+            )
+        elif current_state == RegisterDefectStates.choosing_description.state:
+            # Возвращаемся к состоянию описания
+            await state.set_state(RegisterDefectStates.description)
+            # Очищаем временные данные выбора
+            await state.update_data(original_description=None, summary_description=None)
+            await callback_query.message.answer(
+                "Опишите подробно, что случилось с товаром и в чем заключается дефект.\n\n"
+                "Постарайтесь указать максимальное количество деталей.\n\n"
+                "💡 Вы можете написать текст или отправить голосовое сообщение.",
                 reply_markup=get_back_inline_keyboard(),
             )
         elif current_state == RegisterDefectStates.photos.state:

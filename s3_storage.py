@@ -374,5 +374,33 @@ class S3Storage:
             print(f"Error saving last_id.txt: {str(e)}")
             return False
 
+    def get_file_url(self, defect_id: str, filename: str, expires_in: int = 3600) -> str | None:
+        """
+        Получить публичную URL для файла дефекта из S3.
+        
+        Args:
+            defect_id: ID дефекта
+            filename: Имя файла (например, photo_1.jpg, video_1.mp4)
+            expires_in: Время жизни ссылки в секундах (по умолчанию 1 час)
+        
+        Returns:
+            Публичная URL или None при ошибке
+        """
+        
+        folder = self.get_defect_folder(defect_id)
+        key = f"{folder}/{filename}"
+        
+        try:
+            # Генерируем presigned URL
+            url = self.s3_client.generate_presigned_url(
+                'get_object',
+                Params={'Bucket': self.bucket_name, 'Key': key},
+                ExpiresIn=expires_in
+            )
+            return url
+        except Exception as e:
+            print(f"Error generating URL for {key}: {str(e)}")
+            return None
+
 # Создаем глобальный экземпляр для использования в боте
 s3_storage = S3Storage()
